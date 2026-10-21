@@ -16,11 +16,10 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 
 const ROUTE_SLOT = Symbol.for("pi-trackio.httpRouteSlot");
-const HTML_HOOK_SLOT = Symbol.for("pi-trackio.htmlHookSlot");
-const PI_WEB_INDEX_HTML = join(
-  homedir(),
-  ".local/share/pi-web/node_modules/@agegr/pi-web/.next/server/app/index.html",
-);
+const HTML_HOOK_SLOT = Symbol.for("pi-trackio.htmlHookSlotV2");
+const PI_WEB_ROOT = join(homedir(), ".local/share/pi-web/node_modules/@agegr/pi-web");
+const PI_WEB_INDEX_HTML = join(PI_WEB_ROOT, ".next/server/app/index.html");
+const PI_WEB_APP_CHUNKS_DIR = join(PI_WEB_ROOT, ".next/static/chunks/app");
 
 type RouteHandler = (req: IncomingMessage, res: ServerResponse) => boolean | Promise<boolean>;
 
@@ -426,11 +425,11 @@ export function findPiWebServer(): HttpServer | null {
 export function attachTrackioRoutes(
   server: HttpServer,
   handler: RouteHandler = createTrackioRouteHandler(),
-  version = 3,
+  version = 4,
 ): boolean {
   const host = server as unknown as Record<symbol, RouteSlotState | undefined>;
 
-  // Attach HTML cache-bypass hook so GET / on :30141 serves the fresh on-disk index.html
+  // Attach HTML & patched-chunk hook so GET / and /_next/static/chunks/app/page-*.hp*.js on :30141 serve fresh from disk
   if (!host[HTML_HOOK_SLOT]) {
     host[HTML_HOOK_SLOT] = { version, handler };
     const prevEmit = server.emit.bind(server);
@@ -440,19 +439,33 @@ export function attachTrackioRoutes(
         const rawUrl = req?.url ?? "";
         const qIdx = rawUrl.indexOf("?");
         const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
-        if (
-          (req.method === "GET" || req.method === "HEAD") &&
-          pathname === "/" &&
-          !req.headers["rsc"] &&
-          !req.headers["next-router-prefetch"] &&
-          existsSync(PI_WEB_INDEX_HTML)
-        ) {
-          try {
-            const html = readFileSync(PI_WEB_INDEX_HTML, "utf8");
-            sendText(res, 200, html, "text/html; charset=utf-8");
-            return true;
-          } catch {
-            // fall through to Next.js
+        if (req.method === "GET" || req.method === "HEAD") {
+          if (
+            pathname === "/" &&
+            !req.headers["rsc"] &&
+            !req.headers["next-router-prefetch"] &&
+            existsSync(PI_WEB_INDEX_HTML)
+          ) {
+            try {
+              const html = readFileSync(PI_WEB_INDEX_HTML, "utf8");
+              sendText(res, 200, html, "text/html; charset=utf-8");
+              return true;
+            } catch {
+              // fall through
+            }
+          }
+          const chunkMatch = /^\/_next\/static\/chunks\/app\/(page-[A-Za-z0-9_.-]+\.js)$/.exec(pathname);
+          if (chunkMatch) {
+            const chunkPath = join(PI_WEB_APP_CHUNKS_DIR, chunkMatch[1]);
+            if (existsSync(chunkPath)) {
+              try {
+                const js = readFileSync(chunkPath, "utf8");
+                sendText(res, 200, js, "application/javascript; charset=utf-8");
+                return true;
+              } catch {
+                // fall through
+              }
+            }
           }
         }
       }
