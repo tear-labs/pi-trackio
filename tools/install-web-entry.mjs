@@ -1,11 +1,14 @@
 #!/usr/bin/env node
-// Install the Trackio interactive chart & dashboard bootstrap into direct pi-web pages.
+// Install the Trackio interactive chart & dashboard bootstrap into direct pi-web pages,
+// and bump pi-web's Service Worker STATIC_CACHE version so open browser tabs evict stale chunks.
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, readdirSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const root = process.env.PI_WEB_DIR || join(homedir(), ".local/share/pi-web/node_modules/@agegr/pi-web");
 const bundle = readFileSync(new URL("../src/web-bootstrap.js", import.meta.url), "utf8");
+const hash = createHash("sha256").update(bundle).digest("hex").slice(0, 8);
 const chunks = join(root, ".next/static/chunks/app");
 
 if (existsSync(chunks)) {
@@ -30,4 +33,14 @@ for (const name of ["index.html", "_not-found.html", "login.html"]) {
   );
   writeFileSync(file, html);
 }
-console.log("Installed direct Pi-web Trackio entry.");
+
+const swFile = join(root, "public/sw.js");
+if (existsSync(swFile)) {
+  const sw = readFileSync(swFile, "utf8").replace(
+    /const CACHE_VERSION = new URL\(self\.location\.href\)\.searchParams\.get\("v"\) \|\| "[^"]*";/,
+    `const CACHE_VERSION = new URL(self.location.href).searchParams.get("v") || "trk-${hash}";`,
+  );
+  writeFileSync(swFile, sw);
+}
+
+console.log(`Installed direct Pi-web Trackio entry (sw cache: trk-${hash}).`);
