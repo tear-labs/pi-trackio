@@ -12,7 +12,15 @@ import { loadTrackioConfig, trackioClient } from "./client.ts";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOOTSTRAP_PATH = join(__dirname, "web-bootstrap.js");
 
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+
 const ROUTE_SLOT = Symbol.for("pi-trackio.httpRouteSlot");
+const HTML_HOOK_SLOT = Symbol.for("pi-trackio.htmlHookSlot");
+const PI_WEB_INDEX_HTML = join(
+  homedir(),
+  ".local/share/pi-web/node_modules/@agegr/pi-web/.next/server/app/index.html",
+);
 
 type RouteHandler = (req: IncomingMessage, res: ServerResponse) => boolean | Promise<boolean>;
 
@@ -418,9 +426,40 @@ export function findPiWebServer(): HttpServer | null {
 export function attachTrackioRoutes(
   server: HttpServer,
   handler: RouteHandler = createTrackioRouteHandler(),
-  version = 2,
+  version = 3,
 ): boolean {
   const host = server as unknown as Record<symbol, RouteSlotState | undefined>;
+
+  // Attach HTML cache-bypass hook so GET / on :30141 serves the fresh on-disk index.html
+  if (!host[HTML_HOOK_SLOT]) {
+    host[HTML_HOOK_SLOT] = { version, handler };
+    const prevEmit = server.emit.bind(server);
+    server.emit = function (event: string, ...args: unknown[]): boolean {
+      if (event === "request") {
+        const [req, res] = args as [IncomingMessage, ServerResponse];
+        const rawUrl = req?.url ?? "";
+        const qIdx = rawUrl.indexOf("?");
+        const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
+        if (
+          (req.method === "GET" || req.method === "HEAD") &&
+          pathname === "/" &&
+          !req.headers["rsc"] &&
+          !req.headers["next-router-prefetch"] &&
+          existsSync(PI_WEB_INDEX_HTML)
+        ) {
+          try {
+            const html = readFileSync(PI_WEB_INDEX_HTML, "utf8");
+            sendText(res, 200, html, "text/html; charset=utf-8");
+            return true;
+          } catch {
+            // fall through to Next.js
+          }
+        }
+      }
+      return prevEmit(event, ...args);
+    } as typeof server.emit;
+  }
+
   const existing = host[ROUTE_SLOT];
   if (existing) {
     if (existing.version > version) return false;
