@@ -1,0 +1,21 @@
+[Unit]
+Description=Snapshot Trackio SQLite databases and sync to GCS
+Documentation=https://github.com/gradio-app/trackio
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+Environment=TRACKIO_DIR=%h/.local/share/trackio/data
+Environment=TRACKIO_BACKUP_DIR=%h/.local/share/trackio/backups/latest
+EnvironmentFile=-%h/.config/trackio.env
+ExecStart=%h/.local/share/trackio/backup-gcs.sh
+
+MemoryAccounting=true
+MemoryHigh=1G
+MemoryMax=2G
+OOMPolicy=continue
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal

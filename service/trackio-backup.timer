@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic GCS backup timer for Trackio experiment data
+Documentation=https://github.com/gradio-app/trackio
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

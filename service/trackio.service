@@ -1,0 +1,37 @@
+[Unit]
+Description=Trackio experiment-tracking server (OSS W&B alternative)
+Documentation=https://github.com/gradio-app/trackio
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Machine-specific settings live outside the repo:
+#   ~/.config/trackio.env  TRACKIO_WRITE_TOKEN, TRACKIO_GCS_BUCKET, etc. (written by setup.sh)
+WorkingDirectory=%h
+Environment=TRACKIO_DIR=%h/.local/share/trackio/data
+Environment=TRACKIO_HOST=127.0.0.1
+Environment=TRACKIO_PORT=30143
+Environment=GRADIO_MCP_SERVER=True
+EnvironmentFile=-%h/.config/trackio.env
+ExecStart=%h/.local/share/pipx/venvs/trackio/bin/python %h/.local/share/trackio/serve.py
+
+# Protect the host and isolate memory usage (same per-process OOM policy as pi-web).
+MemoryAccounting=true
+MemoryHigh=2G
+MemoryMax=4G
+MemorySwapMax=512M
+OOMPolicy=continue
+TasksMax=512
+
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
