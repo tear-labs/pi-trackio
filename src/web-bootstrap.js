@@ -19,7 +19,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "trackio-v5";
+  const VERSION = "trackio-v6";
   const versionOf = (value) => Number(/v(\d+)/.exec(String(value ?? ""))?.[1] ?? 0);
   const previous = window.__piTrackioEntryVersion;
   if (previous && versionOf(previous) >= versionOf(VERSION)) return;
@@ -572,6 +572,157 @@
     if (abs < 1) return v.toFixed(4);
     if (abs < 100) return v.toFixed(3);
     return v.toFixed(2);
+  }
+
+  const _seriesCache = new Map();
+  const _seriesInFlight = new Map();
+
+  async function callTrackioApi(endpoint, body = {}) {
+    const res = await fetch(`/__trackio/app/api/${endpoint}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pi-trackio": "1" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (json?.error) throw new Error(json.error);
+    return json?.data;
+  }
+
+  async function fetchSeriesDirect(params = {}) {
+    const key = JSON.stringify({
+      p: params.project || "",
+      r: params.runs || null,
+      x: params.xAxis || "step",
+    });
+    const now = Date.now();
+    const cached = _seriesCache.get(key);
+    if (cached && now - cached.ts < 1500) return cached.data;
+    if (_seriesInFlight.has(key)) return _seriesInFlight.get(key);
+
+    const job = (async () => {
+      const allProjectsRaw = await callTrackioApi("get_all_projects", {});
+      const allProjects = Array.isArray(allProjectsRaw) ? allProjectsRaw : [];
+      const reqProj = String(params.project || "").trim();
+      const project =
+        allProjects.find((p) => p === reqProj) ||
+        allProjects.find((p) => p.toLowerCase() === reqProj.toLowerCase()) ||
+        allProjects[0] ||
+        "";
+      if (!project) {
+        return {
+          project: "",
+          allProjects: [],
+          allRuns: [],
+          selectedRuns: [],
+          availableMetrics: [],
+          selectedMetrics: [],
+          xAxis: params.xAxis || "step",
+          series: [],
+        };
+      }
+
+      const rawRuns = await callTrackioApi("get_runs_for_project", { project });
+      const allRuns = Array.isArray(rawRuns)
+        ? [...rawRuns]
+            .reverse()
+            .map((r) => (typeof r === "string" ? r : r?.name))
+            .filter(Boolean)
+        : [];
+
+      const wantedRuns =
+        Array.isArray(params.runs) && params.runs.length > 0
+          ? allRuns.filter((r) => params.runs.includes(r))
+          : allRuns.slice(0, 12);
+      const selectedRuns = wantedRuns.length > 0 ? wantedRuns : allRuns.slice(0, 12);
+
+      const batch =
+        selectedRuns.length > 0
+          ? await callTrackioApi("get_logs_batch", {
+              project,
+              runs: selectedRuns.map((r) => ({ run: r, run_id: null })),
+              max_points: 220,
+              scalar_only: true,
+            })
+          : [];
+
+      const xAxis = params.xAxis || "step";
+      const reserved = new Set(["step", "time", "timestamp", "_step", "_timestamp", "run"]);
+      const metricSet = new Set();
+
+      const series = (Array.isArray(batch) ? batch : []).map((entry, idx) => {
+        const runName = entry.run;
+        const colorIndex = Math.max(0, allRuns.indexOf(runName));
+        const logs = Array.isArray(entry.logs) ? entry.logs : [];
+        const metricsMap = {};
+        const latest = {};
+        const min = {};
+        const max = {};
+
+        for (let i = 0; i < logs.length; i++) {
+          const row = logs[i];
+          if (!row || typeof row !== "object") continue;
+          const stepVal =
+            typeof row[xAxis] === "number" && Number.isFinite(row[xAxis])
+              ? row[xAxis]
+              : typeof row.step === "number" && Number.isFinite(row.step)
+                ? row.step
+                : i;
+          for (const [k, v] of Object.entries(row)) {
+            if (reserved.has(k)) continue;
+            if (typeof v !== "number" || !Number.isFinite(v)) continue;
+            metricSet.add(k);
+            if (!metricsMap[k]) metricsMap[k] = [];
+            metricsMap[k].push({ step: stepVal, value: v });
+            latest[k] = v;
+            min[k] = min[k] === undefined ? v : Math.min(min[k], v);
+            max[k] = max[k] === undefined ? v : Math.max(max[k], v);
+          }
+        }
+
+        for (const pts of Object.values(metricsMap)) {
+          pts.sort((a, b) => a.step - b.step);
+        }
+
+        return {
+          run: runName,
+          colorIndex: colorIndex >= 0 ? colorIndex : idx,
+          metrics: metricsMap,
+          latest,
+          min,
+          max,
+        };
+      });
+
+      const availableMetrics = [...metricSet].sort((a, b) => {
+        const pa = metricPriority(a);
+        const pb = metricPriority(b);
+        return pa !== pb ? pa - pb : a.localeCompare(b);
+      });
+
+      const out = {
+        project,
+        allProjects,
+        allRuns,
+        selectedRuns,
+        availableMetrics,
+        selectedMetrics: availableMetrics,
+        xAxis,
+        series,
+      };
+      _seriesCache.set(key, { ts: Date.now(), data: out });
+      return out;
+    })()
+      .catch((err) => {
+        if (cached) return cached.data;
+        throw err;
+      })
+      .finally(() => {
+        _seriesInFlight.delete(key);
+      });
+
+    _seriesInFlight.set(key, job);
+    return job;
   }
 
   function computeEma(points, weight) {
@@ -1588,54 +1739,17 @@
 
     async function fetchAndRender(forceRebuild = false) {
       try {
-        // Fetch newest runs list if not explicitly filtered so >12 runs work even on cached v1 server
-        let runsToRequest = state.soloRun
+        const runsToRequest = state.soloRun
           ? [state.soloRun]
           : state.runs.length > 0
             ? state.runs
             : undefined;
-        if (!runsToRequest && state.project) {
-          try {
-            const runsRes = await fetch("/__trackio/app/api/get_runs_for_project", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ project: state.project }),
-            });
-            if (runsRes.ok) {
-              const runsJson = await runsRes.json();
-              if (Array.isArray(runsJson?.data) && runsJson.data.length > 0) {
-                const newestFirst = [...runsJson.data]
-                  .reverse()
-                  .map((r) => (typeof r === "string" ? r : r?.name))
-                  .filter(Boolean);
-                state.allProjectRuns = newestFirst;
-                runsToRequest = newestFirst.slice(0, 20);
-              }
-            }
-          } catch {
-            // fallback to default /__trackio/series runs
-          }
-        }
-        const res = await fetch("/__trackio/series", {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-pi-trackio": "1" },
-          body: JSON.stringify({
-            project: state.project || undefined,
-            runs: runsToRequest,
-            metrics: state.metrics.length > 0 ? state.metrics : undefined,
-            xAxis: state.xAxis,
-          }),
+        const payload = await fetchSeriesDirect({
+          project: state.project || undefined,
+          runs: runsToRequest,
+          xAxis: state.xAxis,
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const payload = await res.json();
-        if (
-          Array.isArray(payload.allProjects) &&
-          payload.allProjects.length > 0 &&
-          (!payload.project || !payload.allProjects.includes(payload.project))
-        ) {
-          state.project = payload.allProjects[0];
-          return await fetchAndRender(forceRebuild);
-        }
+        state.allProjectRuns = payload.allRuns;
         const prevMetricsKey = (state.data?.availableMetrics || []).join("|");
         const nextMetricsKey = (payload.availableMetrics || []).join("|");
         state.data = payload;

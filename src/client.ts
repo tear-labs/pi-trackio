@@ -292,12 +292,13 @@ export class TrackioClient {
   public async getLogsBatch(
     project: string,
     runs: string[],
-    options: { downsample?: number; metrics?: string[] } = {},
+    options: { max_points?: number; scalar_only?: boolean; metrics?: string[] } = {},
   ): Promise<Array<{ run: string; run_id?: string | null; logs: Array<Record<string, unknown>> }>> {
     const payload: Record<string, unknown> = {
       project,
       runs: runs.map((r) => ({ run: r, run_id: null })),
-      ...options,
+      max_points: options.max_points ?? 250,
+      scalar_only: options.scalar_only ?? true,
     };
     const data = await this.callApi<
       Array<{ run: string; run_id?: string | null; logs: Array<Record<string, unknown>> }>
@@ -596,9 +597,12 @@ print(json.dumps({"project": project, "run": getattr(run, "name", run_name or "d
         : allRuns.slice(0, 24);
     const selectedRuns = wantedRuns.length > 0 ? wantedRuns : allRuns.slice(0, 24);
 
-    const batch = selectedRuns.length > 0 ? await this.getLogsBatch(project, selectedRuns) : [];
+    const maxPoints = Math.max(50, Math.min(2000, params.maxPoints ?? 250));
+    const batch =
+      selectedRuns.length > 0
+        ? await this.getLogsBatch(project, selectedRuns, { max_points: maxPoints, scalar_only: true })
+        : [];
     const xAxis = params.xAxis || "step";
-    const maxPoints = Math.max(50, Math.min(2000, params.maxPoints ?? 500));
 
     const metricSet = new Set<string>();
     const reserved = new Set(["step", "time", "timestamp", "_step", "_timestamp", "run"]);
