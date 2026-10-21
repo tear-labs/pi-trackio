@@ -19,7 +19,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "trackio-v6";
+  const VERSION = "trackio-v7";
   const versionOf = (value) => Number(/v(\d+)/.exec(String(value ?? ""))?.[1] ?? 0);
   const previous = window.__piTrackioEntryVersion;
   if (previous && versionOf(previous) >= versionOf(VERSION)) return;
@@ -112,6 +112,17 @@
   const style = document.createElement("style");
   style.id = STYLE_ID;
   style.textContent = `
+    .markdown-code-block.pi-trackio-upgraded {
+      border: none !important;
+      background: transparent !important;
+      box-shadow: none !important;
+      padding: 0 !important;
+    }
+    .markdown-code-block.pi-trackio-upgraded > .markdown-code-header,
+    .markdown-code-block.pi-trackio-upgraded > pre,
+    .markdown-code-block.pi-trackio-upgraded > div:not(.pi-trackio-card) {
+      display: none !important;
+    }
     .pi-trackio-card {
       border: 1px solid var(--border, rgba(150, 190, 255, 0.16));
       border-radius: 12px;
@@ -471,7 +482,7 @@
   function parseTrackioLinkHref(rawHref) {
     if (!rawHref) return null;
     try {
-      if (rawHref.startsWith("trackio://")) {
+      if (rawHref.startsWith("trackio://") || rawHref.startsWith("https://trackio.local") || rawHref.startsWith("http://trackio.local")) {
         const u = new URL(rawHref.replace(/^trackio:\/\//, "http://trackio.local/"));
         const project =
           decodeURIComponent(u.pathname.replace(/^\/+/, "")) ||
@@ -1820,19 +1831,51 @@
     return { root, updateSpec, state };
   }
 
-  function mountInlineCard(hostNode, rawSpec) {
-    let spec = {};
-    if (typeof rawSpec === "string") {
-      try {
-        spec = JSON.parse(rawSpec.trim());
-      } catch {
-        spec = { project: rawSpec.trim() };
-      }
-    } else if (rawSpec && typeof rawSpec === "object") {
-      spec = { ...rawSpec };
+  function extractCodeBlockText(block) {
+    const pre = block.querySelector("pre");
+    if (!pre) return "";
+    const codeNodes = pre.querySelectorAll("code");
+    const target = codeNodes.length > 0 ? codeNodes[codeNodes.length - 1] : pre;
+    const clone = target.cloneNode(true);
+    for (const ln of clone.querySelectorAll(
+      ".react-syntax-highlighter-line-number, .linenumber, [style*='user-select: none'], [style*='user-select:none']",
+    )) {
+      ln.remove();
     }
+    return (clone.textContent || "").trim();
+  }
+
+  function parseTrackioBlockSpec(rawText) {
+    if (!rawText) return null;
+    const trimmed = rawText.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        // Fallback: strip any leftover leading line numbers per line
+        const stripped = trimmed
+          .split(/\r?\n/)
+          .map((line) => line.replace(/^\s*\d+\s+(?=[{"\]\}\s])/, "").replace(/^\s*\d+(?=[{}])/, ""))
+          .join("\n");
+        try {
+          return JSON.parse(stripped);
+        } catch {
+          return null;
+        }
+      }
+    }
+    if (/^[A-Za-z0-9_.-]{1,80}$/.test(trimmed)) {
+      return { project: trimmed };
+    }
+    return null;
+  }
+
+  function mountInlineCard(block, spec) {
+    block.classList.add("pi-trackio-upgraded");
+    const existing = block.querySelector(":scope > .pi-trackio-card");
+    if (existing) existing.remove();
     const explorer = createInteractiveExplorer(spec, { isSidePanel: false });
-    hostNode.replaceWith(explorer.root);
+    block.append(explorer.root);
     if (spec.open_side_panel || spec.openSidePanel) {
       openDock(spec);
     }
@@ -1990,30 +2033,19 @@
 
     const codeBlocks = document.querySelectorAll(".markdown-code-block");
     for (const block of codeBlocks) {
-      if (block.dataset.trackioMounted) continue;
+      if (block.dataset.trackioMounted && block.querySelector(":scope > .pi-trackio-card")) continue;
       const langNode = block.querySelector(".markdown-code-lang");
       const lang = (langNode?.textContent || "").trim().toLowerCase();
       if (lang !== "trackio") continue;
-      const codeNode = block.querySelector("pre code, pre");
-      const rawText = (codeNode?.textContent || "").trim();
-      if (!rawText) continue;
-      let parsedSpec = null;
-      if (rawText.startsWith("{") && rawText.endsWith("}")) {
-        try {
-          parsedSpec = JSON.parse(rawText);
-        } catch {
-          parsedSpec = null;
-        }
-      } else if (/^[A-Za-z0-9_.-]{1,80}$/.test(rawText)) {
-        parsedSpec = { project: rawText };
-      }
+      const rawText = extractCodeBlockText(block);
+      const parsedSpec = parseTrackioBlockSpec(rawText);
       if (!parsedSpec || typeof parsedSpec !== "object") continue;
       block.dataset.trackioMounted = "1";
       mountInlineCard(block, parsedSpec);
     }
 
     const links = document.querySelectorAll(
-      '.markdown-body a[href*="/__trackio"], .markdown-body a[href*="127.0.0.1:30143"], .markdown-body a[href*="localhost:30143"], .markdown-body a[href^="trackio://"]',
+      '.markdown-body a[href*="/__trackio"], .markdown-body a[href*="127.0.0.1:30143"], .markdown-body a[href*="localhost:30143"], .markdown-body a[href^="trackio://"], .markdown-body a[href*="trackio.local"]',
     );
     for (const link of links) {
       if (
@@ -2023,20 +2055,18 @@
       ) {
         continue;
       }
-      const parsed = parseTrackioLinkHref(link.getAttribute("href") || "");
+      const origHref = link.getAttribute("href") || "";
+      const parsed = parseTrackioLinkHref(origHref);
       if (!parsed) continue;
       link.dataset.trackioEnhanced = "1";
+      link.dataset.trackioSpec = JSON.stringify(parsed);
       link.classList.add("pi-trackio-dashboard-link");
       const sameOriginUrl = buildTrackioAppUrl(parsed);
       link.setAttribute("href", sameOriginUrl);
+      // Setting target="_blank" prevents pi-web's React onClick from treating /__trackio/* as a local file path
+      link.setAttribute("target", "_blank");
+      link.setAttribute("rel", "noopener noreferrer");
       link.title = "Click to open in Trackio split-screen side panel";
-
-      link.addEventListener("click", (e) => {
-        if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
-        e.preventDefault();
-        e.stopPropagation();
-        openDock(parsed);
-      });
 
       const extTab = document.createElement("a");
       extTab.className = "pi-trackio-ext-tab";
@@ -2048,6 +2078,38 @@
       link.insertAdjacentElement("afterend", extTab);
     }
   }
+
+  // Window capture-phase listener runs BEFORE React's root click delegation
+  window.addEventListener(
+    "click",
+    (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      const anchor = target.closest("a");
+      if (!anchor) return;
+      if (anchor.classList.contains("pi-trackio-ext-tab") || anchor.classList.contains("pi-trackio-btn")) {
+        return;
+      }
+      let parsed = null;
+      if (anchor.dataset.trackioSpec) {
+        try {
+          parsed = JSON.parse(anchor.dataset.trackioSpec);
+        } catch {
+          parsed = null;
+        }
+      }
+      if (!parsed) {
+        parsed = parseTrackioLinkHref(anchor.getAttribute("href") || "");
+      }
+      if (!parsed) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      openDock(parsed);
+    },
+    true,
+  );
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", scanDom, { once: true });
