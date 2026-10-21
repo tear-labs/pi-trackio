@@ -593,8 +593,8 @@ print(json.dumps({"project": project, "run": getattr(run, "name", run_name or "d
     const wantedRuns =
       params.runs && params.runs.length > 0
         ? allRuns.filter((r) => params.runs!.includes(r))
-        : allRuns.slice(0, 12);
-    const selectedRuns = wantedRuns.length > 0 ? wantedRuns : allRuns.slice(0, 12);
+        : allRuns.slice(0, 24);
+    const selectedRuns = wantedRuns.length > 0 ? wantedRuns : allRuns.slice(0, 24);
 
     const batch = selectedRuns.length > 0 ? await this.getLogsBatch(project, selectedRuns) : [];
     const xAxis = params.xAxis || "step";

@@ -19,7 +19,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "trackio-v4";
+  const VERSION = "trackio-v5";
   const versionOf = (value) => Number(/v(\d+)/.exec(String(value ?? ""))?.[1] ?? 0);
   const previous = window.__piTrackioEntryVersion;
   if (previous && versionOf(previous) >= versionOf(VERSION)) return;
@@ -1022,12 +1022,10 @@
     runFocusSelect.onchange = () => {
       state.soloRun = runFocusSelect.value;
       popBtn.href = buildTrackioAppUrl(state);
-      rebuildRunsAndSummary();
+      void fetchAndRender(true);
       if (state.mode === "dashboard") {
         const iframe = bodyWrap.querySelector("iframe");
         if (iframe) iframe.src = buildTrackioAppUrl({ ...state, sidebar: "collapsed" });
-      } else {
-        rebuildPlotGrid();
       }
     };
 
@@ -1438,17 +1436,20 @@
       }
 
       const series = data.series || [];
+      const allRunNames = Array.isArray(state.allProjectRuns) && state.allProjectRuns.length > 0
+        ? state.allProjectRuns
+        : series.map((s) => s.run);
       runFocusSelect.innerHTML = "";
       const allOpt = document.createElement("option");
       allOpt.value = "";
-      allOpt.textContent = `All Runs (${series.length})`;
+      allOpt.textContent = `All Runs (${allRunNames.length})`;
       if (!state.soloRun) allOpt.selected = true;
       runFocusSelect.append(allOpt);
-      for (const s of series) {
+      for (const rName of allRunNames) {
         const opt = document.createElement("option");
-        opt.value = s.run;
-        opt.textContent = `🎯 ${s.run}`;
-        if (s.run === state.soloRun) opt.selected = true;
+        opt.value = rName;
+        opt.textContent = `🎯 ${rName}`;
+        if (rName === state.soloRun) opt.selected = true;
         runFocusSelect.append(opt);
       }
 
@@ -1587,12 +1588,40 @@
 
     async function fetchAndRender(forceRebuild = false) {
       try {
+        // Fetch newest runs list if not explicitly filtered so >12 runs work even on cached v1 server
+        let runsToRequest = state.soloRun
+          ? [state.soloRun]
+          : state.runs.length > 0
+            ? state.runs
+            : undefined;
+        if (!runsToRequest && state.project) {
+          try {
+            const runsRes = await fetch("/__trackio/app/api/get_runs_for_project", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ project: state.project }),
+            });
+            if (runsRes.ok) {
+              const runsJson = await runsRes.json();
+              if (Array.isArray(runsJson?.data) && runsJson.data.length > 0) {
+                const newestFirst = [...runsJson.data]
+                  .reverse()
+                  .map((r) => (typeof r === "string" ? r : r?.name))
+                  .filter(Boolean);
+                state.allProjectRuns = newestFirst;
+                runsToRequest = newestFirst.slice(0, 20);
+              }
+            }
+          } catch {
+            // fallback to default /__trackio/series runs
+          }
+        }
         const res = await fetch("/__trackio/series", {
           method: "POST",
           headers: { "content-type": "application/json", "x-pi-trackio": "1" },
           body: JSON.stringify({
             project: state.project || undefined,
-            runs: state.runs.length > 0 ? state.runs : undefined,
+            runs: runsToRequest,
             metrics: state.metrics.length > 0 ? state.metrics : undefined,
             xAxis: state.xAxis,
           }),
