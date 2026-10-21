@@ -37,8 +37,8 @@ for (const name of ["index.html", "_not-found.html", "login.html"]) {
 const swFile = join(root, "public/sw.js");
 if (existsSync(swFile)) {
   const sw = readFileSync(swFile, "utf8").replace(
-    /const CACHE_VERSION = new URL\(self\.location\.href\)\.searchParams\.get\("v"\) \|\| "[^"]*";/,
-    `const CACHE_VERSION = new URL(self.location.href).searchParams.get("v") || "trk-${hash}";`,
+    /const STATIC_CACHE = `\$\{CACHE_PREFIX\}-static-\$\{CACHE_VERSION\}[^\`;]*`;/,
+    `const STATIC_CACHE = \`\${CACHE_PREFIX}-static-\${CACHE_VERSION}-trk-${hash}\`;`,
   );
   writeFileSync(swFile, sw);
 }
