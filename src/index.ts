@@ -4,6 +4,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { trackioClient, type PlotSeriesPayload } from "./client.ts";
 import { attachTrackioRoutes, findPiWebServer } from "./web-proxy.ts";
+import { collectComputeSnapshot, computeSummaryMarkdown } from "./compute/snapshot.ts";
 
 export const TRACKIO_EMBED_TYPE = "trackio-embed";
 
@@ -460,6 +461,25 @@ export default function piTrackioExtension(pi: ExtensionAPI) {
         ],
         details: res,
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "compute_status",
+    label: "Active Compute Dashboard",
+    description: "Active compute across Modal, Google Cloud, SF Compute and Vast.ai (credit, burn rate, runway, GPU utilization), cross-linked to Trackio projects and metric freshness. Read-only.",
+    parameters: Type.Object({ open: Type.Optional(Type.Boolean({ description: "Also return the dashboard link (default true)" })) }),
+    async execute(_toolCallId, params) {
+      ensurePiWebMounted();
+      const snapshot = await collectComputeSnapshot();
+      return { content: [{ type: "text", text: computeSummaryMarkdown(snapshot, params.open !== false) }], details: { snapshot } };
+    },
+  });
+  pi.registerCommand("compute", {
+    description: "Show active compute across Modal / GCP / SF Compute / Vast.ai, linked to Trackio",
+    handler: async (_args, ctx) => {
+      ensurePiWebMounted();
+      ctx.ui.notify(computeSummaryMarkdown(await collectComputeSnapshot(), false).split("\n")[0].slice(0, 199), "info");
     },
   });
 

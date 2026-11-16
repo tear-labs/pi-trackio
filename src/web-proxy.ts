@@ -8,9 +8,13 @@ import {
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadTrackioConfig, trackioClient } from "./client.ts";
+import { collectComputeSnapshot } from "./compute/snapshot.ts";
+import { computePage } from "./compute/page.ts";
+import type { ComputeSnapshot } from "./compute/types.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOOTSTRAP_PATH = join(__dirname, "web-bootstrap.js");
+const STATUS_PANEL_PATH = join(__dirname, "run-status-panel.js");
 
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -33,6 +37,10 @@ export interface TrackioProxyOptions {
   piWebUrl?: string | null;
   /** Always verify upstream pi-web auth on every request. */
   verifyUpstream?: boolean;
+  /** Test seam: replaces the live provider collectors. */
+  computeSnapshot?: () => Promise<ComputeSnapshot>;
+  /** Test seam: replaces the live dashboard HTML. */
+  computePageHtml?: () => string;
 }
 
 const HOP_BY_HOP = new Set([
@@ -187,7 +195,25 @@ export function rewriteTrackioHtml(html: string, basePath = "/__trackio/app"): s
       `<head><script>window.__trackio_base = ${JSON.stringify(basePath)};</script>`,
     );
   }
+  if (!out.includes('id="pi-trackio-all-charts"')) {
+    out = out.replace(/<body>/i, `<body><nav id="pi-trackio-all-charts" style="height:34px;padding:6px 12px;background:#121827;color:#dbeafe;font:13px system-ui;box-sizing:border-box"><a style="color:#7dd3fc" href="/__trackio/charts">All charts · Run activity</a><span style="margin-left:12px">One scrollable dashboard; charts render as you scroll.</span></nav><style>#app>.app{height:calc(100dvh - 34px)!important}</style><script>(()=>{const link=document.querySelector('#pi-trackio-all-charts a');const params=new URLSearchParams(location.search);params.delete('metrics');params.delete('metric_filter');link.search=params.toString();})()</script>`);
+  }
+  if (!out.includes('src="/__trackio/run-status-panel.js"')) {
+    out = out.replace(/<\/body>/i, '<script defer src="/__trackio/run-status-panel.js"></script></body>');
+  }
   return out;
+}
+
+export function chartsPage(url: URL): string {
+  const spec = {
+    project: url.searchParams.get("project") || "",
+    runs: (url.searchParams.get("runs") || "").split(",").filter(Boolean),
+    smoothing: Number(url.searchParams.get("smoothing") || 10),
+    metrics: (url.searchParams.get("metrics") || "").split(",").filter(Boolean),
+    allRuns: true,
+  };
+  const json = JSON.stringify(spec).replace(/</g, "\\u003c");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Trackio · All charts</title><style>html,body{margin:0;height:100%;background:#0d1326;color:#f1f5ff;font:13px system-ui}body{display:flex;flex-direction:column}#pi-trackio-standalone{flex:1;min-height:0;display:flex;flex-direction:column}#pi-trackio-standalone .pi-trackio-dock-scroll{overflow:auto;flex:1;min-height:0}#pi-trackio-standalone .pi-trackio-runs-bar{max-height:100px;overflow:auto}#pi-trackio-standalone .pi-trackio-summary-wrap{display:none!important}a{color:#7dd3fc}</style></head><body><div id="pi-trackio-standalone"></div><script>window.__piTrackioStandalone=${json};</script><script src="/__trackio/bootstrap.js"></script></body></html>`;
 }
 
 function proxyToTrackio(
@@ -195,6 +221,7 @@ function proxyToTrackio(
   res: ServerResponse,
   upstreamPath: string,
   basePath = "/__trackio/app",
+  body?: Buffer,
 ): void {
   const cfg = loadTrackioConfig();
   const upstreamUrl = new URL(cfg.serverUrl);
@@ -207,6 +234,7 @@ function proxyToTrackio(
     const val = req.headers[key];
     if (typeof val === "string") headers[key] = val;
   }
+  if (body) headers["content-length"] = String(body.length);
   if (cfg.writeToken) {
     headers["x-trackio-write-token"] = cfg.writeToken;
     headers.cookie = `trackio_write_token=${encodeURIComponent(cfg.writeToken)}`;
@@ -286,7 +314,17 @@ function proxyToTrackio(
   });
 
   res.on("close", () => upstreamReq.destroy());
-  req.pipe(upstreamReq);
+  if (body) upstreamReq.end(body);
+  else req.pipe(upstreamReq);
+}
+
+// Dashboard previews share pi-web's browser thread. Keep the default history
+// bounded across the selection, rather than 3,000 rows for every selected run.
+// Explicit resolutions (including the native chart view's 220) stay intact.
+export function dashboardLogsRequest(body: Record<string, unknown>): Record<string, unknown> {
+  if (body.max_points != null) return body;
+  const count = Array.isArray(body.runs) ? Math.max(1, body.runs.length) : 1;
+  return { ...body, max_points: Math.max(1, Math.min(500, Math.floor(4000 / count))) };
 }
 
 export function createTrackioRouteHandler(options: TrackioProxyOptions = {}): RouteHandler {
@@ -309,14 +347,45 @@ export function createTrackioRouteHandler(options: TrackioProxyOptions = {}): Ro
     const url = new URL(rawUrl, `http://${req.headers.host ?? "127.0.0.1"}`);
     const pathname = url.pathname;
 
+    if (pathname === "/__trackio/compute" && (req.method === "GET" || req.method === "HEAD")) {
+      sendText(res, 200, (options.computePageHtml ?? computePage)(), "text/html; charset=utf-8");
+      return true;
+    }
+    if (pathname === "/__trackio/compute.json" && req.method === "GET") {
+      try {
+        sendJson(res, 200, await (options.computeSnapshot ?? (() => collectComputeSnapshot({ force: url.searchParams.get("force") === "1" })))());
+      } catch (error) { sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) }); }
+      return true;
+    }
+
+    if (pathname === "/__trackio/charts" && (req.method === "GET" || req.method === "HEAD")) {
+      sendText(res, 200, chartsPage(url), "text/html; charset=utf-8");
+      return true;
+    }
+
+    if (pathname === "/__trackio/activity" && req.method === "GET") {
+      const project = url.searchParams.get("project");
+      if (!project) sendJson(res, 400, { error: "project is required" });
+      else {
+        try { sendJson(res, 200, await trackioClient.getRunActivity(project)); }
+        catch (error) { sendJson(res, 502, { error: (error as Error).message }); }
+      }
+      return true;
+    }
+
+    if (pathname === "/__trackio/frontend_version" && (req.method === "GET" || req.method === "HEAD")) {
+      proxyToTrackio(req, res, pathname + url.search);
+      return true;
+    }
+
     if (pathname.startsWith("/static/trackio/")) {
       proxyToTrackio(req, res, pathname + url.search, "/__trackio/app");
       return true;
     }
 
-    if (pathname === "/__trackio/bootstrap.js" && (req.method === "GET" || req.method === "HEAD")) {
+    if (["/__trackio/bootstrap.js", "/__trackio/run-status-panel.js"].includes(pathname) && (req.method === "GET" || req.method === "HEAD")) {
       try {
-        const js = readFileSync(BOOTSTRAP_PATH, "utf8");
+        const js = readFileSync(pathname.endsWith("run-status-panel.js") ? STATUS_PANEL_PATH : BOOTSTRAP_PATH, "utf8");
         sendText(res, 200, js, "text/javascript; charset=utf-8");
       } catch (err) {
         sendText(res, 500, `// bootstrap load error: ${(err as Error)?.message ?? err}`, "text/javascript");
@@ -393,6 +462,23 @@ export function createTrackioRouteHandler(options: TrackioProxyOptions = {}): Ro
         return true;
       }
       const subPath = pathname.slice("/__trackio/app".length) || "/";
+      if ((subPath === "/" || subPath === "") && req.method === "GET" &&
+          !url.searchParams.get("metrics") && !url.searchParams.get("metric_filter")) {
+        // Old bookmarks otherwise mount every metric in the project at once.
+        url.searchParams.set("metric_filter", "^(loss|ce|train/(loss|ce|grad_norm|lr)|eval/(loss|heldout_ce))$");
+        res.writeHead(302, { location: url.pathname + url.search, "cache-control": "no-store" });
+        res.end();
+        return true;
+      }
+      if (subPath === "/api/get_logs_batch" && req.method === "POST") {
+        try {
+          const body = dashboardLogsRequest(await readJsonBody(req));
+          proxyToTrackio(req, res, subPath + url.search, "/__trackio/app", Buffer.from(JSON.stringify(body)));
+        } catch (error) {
+          sendJson(res, 400, { error: (error as Error).message });
+        }
+        return true;
+      }
       proxyToTrackio(req, res, subPath + url.search, "/__trackio/app");
       return true;
     }
@@ -425,7 +511,7 @@ export function findPiWebServer(): HttpServer | null {
 export function attachTrackioRoutes(
   server: HttpServer,
   handler: RouteHandler = createTrackioRouteHandler(),
-  version = 4,
+  version = 7,
 ): boolean {
   const host = server as unknown as Record<symbol, RouteSlotState | undefined>;
 

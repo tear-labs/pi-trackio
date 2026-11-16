@@ -19,7 +19,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "trackio-v7";
+  const VERSION = "trackio-v11";
   const versionOf = (value) => Number(/v(\d+)/.exec(String(value ?? ""))?.[1] ?? 0);
   const previous = window.__piTrackioEntryVersion;
   if (previous && versionOf(previous) >= versionOf(VERSION)) return;
@@ -36,6 +36,9 @@
   const TOOLBAR_ID = "pi-web-trackio-toolbar";
   const DOCK_ID = "pi-trackio-dock";
   const STYLE_ID = "pi-trackio-style";
+  const COMPUTE_DOCK_ID = "pi-compute-dock";
+  const COMPUTE_TOOLBAR_ID = "pi-web-compute-toolbar";
+  const COMPUTE_URL = "/__trackio/compute";
 
   const PALETTE = [
     "#f97316", // orange
@@ -274,6 +277,8 @@
       color: var(--text, #f1f5ff);
       margin-bottom: 4px;
       padding: 0 2px;
+      flex-wrap: wrap;
+      overflow-wrap: anywhere;
     }
     .pi-trackio-plot-sub {
       font-size: 10px;
@@ -435,6 +440,32 @@
       color: #fff !important;
     }
   `;
+  style.textContent += `
+    #pi-compute-dock {
+      position:relative; display:flex; flex-direction:column;
+      flex:0 0 var(--pi-compute-width, clamp(420px, 46vw, 780px));
+      min-width:360px; height:100%; min-height:0; background:#0a1020;
+      border-left:1px solid rgba(125,211,252,.18); overflow:hidden;
+      color:var(--text,#f1f5ff); font-family:system-ui,-apple-system,sans-serif;
+    }
+    .pi-compute-grip {
+      position:absolute; left:0; top:0; bottom:0; width:6px;
+      cursor:col-resize; z-index:10;
+    }
+    .pi-compute-grip:hover, .pi-compute-grip.is-dragging {
+      background:rgba(56,189,248,.18);
+    }
+    .pi-compute-header {
+      display:flex; align-items:center; gap:6px; padding:0 10px;
+      height:40px; flex:0 0 40px; box-sizing:border-box;
+      border-bottom:1px solid var(--border,rgba(150,190,255,.14));
+      background:rgba(255,255,255,.03); font-size:12px;
+      color:var(--text-dim,#a2b2d4);
+    }
+    .pi-compute-header strong { font-size:13px; color:var(--text,#f1f5ff); }
+    .pi-compute-body { display:flex; flex:1; min-height:0; }
+    .pi-compute-dock iframe{flex:1;min-height:0}
+  `;
   document.head.append(style);
 
   function currentThemeParam() {
@@ -469,6 +500,13 @@
       params.set("metrics", spec.metrics.join(","));
     } else if (spec.metricFilter) {
       params.set("metric_filter", spec.metricFilter);
+    } else {
+      // A project can contain thousands of metrics. Mounting all their Svelte
+      // chart panels freezes the shared pi-web thread before Vega's viewport
+      // guard runs. Start with an overview; the dashboard pager exposes the rest.
+      const overview = spec.data?.availableMetrics?.slice(0, 12);
+      if (overview?.length) params.set("metrics", overview.join(","));
+      else params.set("metric_filter", "^(loss|ce|train/(loss|ce|grad_norm|lr)|eval/(loss|heldout_ce))$");
     }
     if (spec.xAxis && spec.xAxis !== "step") params.set("x_axis", spec.xAxis);
     if (spec.smoothing != null) params.set("smoothing", String(spec.smoothing));
@@ -477,6 +515,15 @@
     params.set("__theme", currentThemeParam());
     const qs = params.toString();
     return `/__trackio/app${pagePath}${qs ? `?${qs}` : ""}`;
+  }
+
+  function isComputeHref(href) {
+    if (!href) return false;
+    try {
+      return new URL(href, window.location.href).pathname === COMPUTE_URL;
+    } catch {
+      return String(href).startsWith(COMPUTE_URL);
+    }
   }
 
   function parseTrackioLinkHref(rawHref) {
@@ -605,6 +652,7 @@
       p: params.project || "",
       r: params.runs || null,
       x: params.xAxis || "step",
+      all: Boolean(params.allRuns),
     });
     const now = Date.now();
     const cached = _seriesCache.get(key);
@@ -644,7 +692,7 @@
       const wantedRuns =
         Array.isArray(params.runs) && params.runs.length > 0
           ? allRuns.filter((r) => params.runs.includes(r))
-          : allRuns.slice(0, 12);
+          : params.allRuns ? allRuns : allRuns.slice(0, 12);
       const selectedRuns = wantedRuns.length > 0 ? wantedRuns : allRuns.slice(0, 12);
 
       const batch =
@@ -652,7 +700,7 @@
           ? await callTrackioApi("get_logs_batch", {
               project,
               runs: selectedRuns.map((r) => ({ run: r, run_id: null })),
-              max_points: 220,
+              max_points: Math.max(1, Math.min(220, Math.floor(4000 / selectedRuns.length))),
               scalar_only: true,
             })
           : [];
@@ -749,6 +797,15 @@
   }
 
   // --- Interactive Canvas Plot Renderer --------------------------------------
+  function matchesJobFilter(state, run) {
+    if (!state.jobFilter || state.jobFilter === "all") return true;
+    const records = (state.activity?.runs || []).filter(r => r.run_name === run);
+    const status = records.length === 1 ? records[0].job?.status || "unknown" : "unknown";
+    if (state.jobFilter === "running") return status === "running";
+    if (state.jobFilter === "finished") return ["completed", "failed", "cancelled", "stopped"].includes(status);
+    return ["unknown", "checking"].includes(status);
+  }
+
   function renderMetricPlot(plotBox, metricName, state, onHoverStep, onZoomRange) {
     const wrap = plotBox.querySelector(".pi-trackio-canvas-wrap");
     const canvas = wrap.querySelector("canvas");
@@ -778,6 +835,7 @@
     const plotH = Math.max(40, height - padT - padB);
 
     const activeSeries = (state.data?.series || []).filter((s) => {
+      if (!matchesJobFilter(state, s.run)) return false;
       if (state.soloRun && s.run !== state.soloRun) return false;
       if (!state.soloRun && state.disabledRuns.has(s.run)) return false;
       return Array.isArray(s.metrics?.[metricName]) && s.metrics[metricName].length > 0;
@@ -1133,6 +1191,7 @@
       soloRun: spec.soloRun || (initialRuns.length === 1 ? initialRuns[0] : ""),
       metrics: Array.isArray(spec.metrics) ? spec.metrics : [],
       metricGroup: spec.metrics?.length ? "all" : "core",
+      allRuns: Boolean(spec.allRuns),
       xAxis: spec.x_axis || spec.xAxis || "step",
       smoothing: typeof spec.smoothing === "number" ? spec.smoothing : 10,
       logX: Boolean(spec.log_x || spec.logX),
@@ -1146,6 +1205,10 @@
       data: null,
       loading: true,
       error: null,
+      dashboardOffset: 0,
+      dashboardFilter: "",
+      activity: null,
+      jobFilter: "all",
     };
 
     const root = document.createElement("div");
@@ -1153,6 +1216,7 @@
     if (isSidePanel) {
       root.style.cssText = "display:flex;flex-direction:column;height:100%;width:100%;overflow:hidden";
     }
+    if (window.__piTrackioStandalone) state.metricGroup = "all";
 
     const header = document.createElement("div");
     header.className = "pi-trackio-header";
@@ -1174,6 +1238,7 @@
       state.runs = [];
       state.disabledRuns.clear();
       state.xRange = null;
+      state.dashboardOffset = 0;
       void fetchAndRender(true);
     };
 
@@ -1186,20 +1251,19 @@
       popBtn.href = buildTrackioAppUrl(state);
       void fetchAndRender(true);
       if (state.mode === "dashboard") {
-        const iframe = bodyWrap.querySelector("iframe");
-        if (iframe) iframe.src = buildTrackioAppUrl({ ...state, sidebar: "collapsed" });
+        refreshDashboard();
       }
     };
 
     const liveBadge = document.createElement("button");
     liveBadge.type = "button";
     liveBadge.className = "pi-trackio-live" + (state.live ? "" : " is-paused");
-    liveBadge.textContent = state.live ? "● Live" : "Paused";
-    liveBadge.title = "Toggle live auto-refresh (4s)";
+    liveBadge.textContent = state.live ? "Auto-refresh on" : "Auto-refresh off";
+    liveBadge.title = "Refresh chart data every 4s; this does not indicate whether a run is running";
     liveBadge.onclick = () => {
       state.live = !state.live;
       liveBadge.className = "pi-trackio-live" + (state.live ? "" : " is-paused");
-      liveBadge.textContent = state.live ? "● Live" : "Paused";
+      liveBadge.textContent = state.live ? "Auto-refresh on" : "Auto-refresh off";
     };
 
     const spacer = document.createElement("div");
@@ -1412,12 +1476,62 @@
         for (const [k, b] of dashPageBtns.entries()) {
           b.className = "pi-trackio-btn" + (k === pval ? " is-active" : "");
         }
-        const iframe = bodyWrap.querySelector("iframe");
-        if (iframe) iframe.src = buildTrackioAppUrl({ ...state, sidebar: "collapsed" });
+        refreshDashboard();
       };
       dashPageBtns.set(pval, pb);
       dashNav.append(pb);
     }
+
+    const dashboardMetrics = document.createElement("div");
+    dashboardMetrics.className = "pi-trackio-controls";
+    const dashboardSearch = document.createElement("input");
+    dashboardSearch.className = "pi-trackio-filter";
+    dashboardSearch.placeholder = "Find metrics (text or regex)";
+    dashboardSearch.setAttribute("aria-label", "Find dashboard metrics");
+    const dashboardCount = document.createElement("span");
+    const dashboardPrev = document.createElement("button");
+    const dashboardNext = document.createElement("button");
+    for (const [button, label, direction] of [[dashboardPrev, "Previous charts", -1], [dashboardNext, "Next charts", 1]]) {
+      button.type = "button";
+      button.className = "pi-trackio-btn";
+      button.textContent = label;
+      button.onclick = () => {
+        state.dashboardOffset = Math.max(0, state.dashboardOffset + direction * 12);
+        refreshDashboard();
+      };
+    }
+    dashboardSearch.onchange = () => {
+      state.dashboardFilter = dashboardSearch.value.trim();
+      state.dashboardOffset = 0;
+      refreshDashboard();
+    };
+    dashboardMetrics.append(dashboardSearch, dashboardPrev, dashboardNext, dashboardCount);
+
+    const allChartsLink = document.createElement("a");
+    allChartsLink.className = "pi-trackio-btn";
+    allChartsLink.textContent = "All charts · Run activity";
+    allChartsLink.target = "_blank";
+    allChartsLink.rel = "noopener";
+    header.append(allChartsLink);
+    const activitySummary = document.createElement("div");
+    activitySummary.style.cssText = "padding:6px 10px;font-size:11px;color:var(--text-dim,#a2b2d4)";
+    activitySummary.title = "Job state comes from the worker record or compute provider. Check each badge for its source and check time. Metric timestamps are separate.";
+    const jobFilterSelect = document.createElement("select");
+    jobFilterSelect.className = "pi-trackio-select";
+    jobFilterSelect.setAttribute("aria-label", "Filter runs by job status");
+    for (const [value, label] of [["all", "All job states"], ["running", "Running only"], ["finished", "Finished / stopped"], ["unknown", "Unknown / checking"]]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      jobFilterSelect.append(option);
+    }
+    jobFilterSelect.onchange = () => {
+      state.jobFilter = jobFilterSelect.value;
+      state.soloRun = "";
+      rebuildRunsAndSummary();
+      if (state.mode === "chart") rebuildPlotGrid();
+    };
+    header.append(jobFilterSelect);
 
     const runsBar = document.createElement("div");
     runsBar.className = "pi-trackio-runs-bar";
@@ -1434,10 +1548,50 @@
     summaryWrap.className = "pi-trackio-summary-wrap";
 
     scrollArea.append(bodyWrap, summaryWrap);
-    root.append(header, controls, dashNav, runsBar, scrollArea);
+    root.append(header, controls, dashNav, dashboardMetrics, activitySummary, runsBar, scrollArea);
+
+    const visiblePlots = new Set();
+    const plotObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        const box = entry.target;
+        const wrap = box.querySelector(".pi-trackio-canvas-wrap");
+        if (entry.isIntersecting) {
+          visiblePlots.add(box);
+          if (!wrap.querySelector("canvas")) {
+            const tooltip = document.createElement("div");
+            tooltip.className = "pi-trackio-tooltip";
+            wrap.append(document.createElement("canvas"), tooltip);
+          }
+          repaintPlot(box);
+        } else {
+          visiblePlots.delete(box);
+          wrap.replaceChildren();
+        }
+      }
+    }, { root: isSidePanel ? scrollArea : null, rootMargin: "400px 0px" });
+
+    function refreshDashboard() {
+      if (state.mode !== "dashboard") return;
+      let metrics = state.metrics.length ? state.metrics : (state.data?.availableMetrics || []);
+      if (state.dashboardFilter) metrics = metrics.filter(m => safeMatchMetric(m, state.dashboardFilter));
+      if (state.dashboardOffset >= metrics.length) state.dashboardOffset = 0;
+      const page = metrics.slice(state.dashboardOffset, state.dashboardOffset + 12);
+      dashboardCount.textContent = metrics.length ? `${state.dashboardOffset + 1}–${state.dashboardOffset + page.length} of ${metrics.length} charts` : "No matching metrics";
+      dashboardPrev.disabled = state.dashboardOffset === 0;
+      dashboardNext.disabled = state.dashboardOffset + 12 >= metrics.length;
+      dashboardMetrics.style.display = state.page === "metrics" ? "flex" : "none";
+      const iframe = bodyWrap.querySelector("iframe");
+      if (!iframe) return;
+      const url = buildTrackioAppUrl({ ...state, metrics: page, metricFilter: page.length ? undefined : "(?!)", sidebar: "collapsed" });
+      if (iframe.getAttribute("src") !== url) iframe.src = url;
+    }
 
     function visibleMetricsList() {
       let avail = [...(state.data?.availableMetrics || [])];
+      if (state.jobFilter !== "all") {
+        const shown = (state.data?.series || []).filter(s => matchesJobFilter(state, s.run));
+        avail = avail.filter(m => shown.some(s => s.metrics?.[m]?.length));
+      }
       if (state.soloRun) {
         const soloSeries = (state.data?.series || []).find((s) => s.run === state.soloRun);
         if (soloSeries?.metrics) {
@@ -1452,7 +1606,7 @@
 
       if (state.metrics && state.metrics.length > 0) {
         const matched = avail.filter((m) => state.metrics.some((pat) => safeMatchMetric(m, pat)));
-        if (matched.length > 0) return matched;
+        return matched;
       }
 
       if (state.metricGroup === "core") {
@@ -1482,20 +1636,25 @@
       dashModeBtn.className = "pi-trackio-btn" + (mode === "dashboard" ? " is-active" : "");
       controls.style.display = mode === "chart" ? "flex" : "none";
       dashNav.style.display = mode === "dashboard" ? "flex" : "none";
+      dashboardMetrics.style.display = mode === "dashboard" && state.page === "metrics" ? "flex" : "none";
       runsBar.style.display = mode === "chart" ? "flex" : "none";
       summaryWrap.style.display = mode === "chart" ? "block" : "none";
+      liveBadge.style.display = mode === "chart" ? "inline-flex" : "none";
+      jobFilterSelect.style.display = mode === "chart" ? "inline-flex" : "none";
       popBtn.href = buildTrackioAppUrl(state);
       if (mode === "dashboard") {
+        plotObserver.disconnect();
+        visiblePlots.clear();
         bodyWrap.innerHTML = "";
         const wrap = document.createElement("div");
         wrap.className = "pi-trackio-iframe-wrap";
         if (isSidePanel) wrap.style.height = "calc(100vh - 88px)";
         const iframe = document.createElement("iframe");
-        iframe.src = buildTrackioAppUrl({ ...state, sidebar: "collapsed" });
         iframe.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-popups");
         iframe.allow = "clipboard-write";
         wrap.append(iframe);
         bodyWrap.append(wrap);
+        refreshDashboard();
       } else {
         rebuildPlotGrid();
       }
@@ -1504,9 +1663,7 @@
     chartModeBtn.onclick = () => setMode("chart");
     dashModeBtn.onclick = () => setMode("dashboard");
 
-    function repaintPlots() {
-      const boxes = bodyWrap.querySelectorAll(".pi-trackio-plot-box");
-      for (const box of boxes) {
+    function repaintPlot(box) {
         const m = box.dataset.metric;
         if (m) {
           renderMetricPlot(
@@ -1515,7 +1672,7 @@
             state,
             (step) => {
               state.hoverStep = step;
-              for (const b of bodyWrap.querySelectorAll(".pi-trackio-plot-box")) {
+              for (const b of visiblePlots) {
                 if (b.dataset.metric) renderMetricPlot(b, b.dataset.metric, state, () => {}, () => {});
               }
             },
@@ -1526,11 +1683,16 @@
             },
           );
         }
-      }
+    }
+
+    function repaintPlots() {
+      for (const box of visiblePlots) repaintPlot(box);
     }
 
     function rebuildPlotGrid() {
       if (state.mode !== "chart") return;
+      plotObserver.disconnect();
+      visiblePlots.clear();
       bodyWrap.innerHTML = "";
       if (state.loading && !state.data) {
         const msg = document.createElement("div");
@@ -1556,7 +1718,7 @@
       }
       const grid = document.createElement("div");
       grid.className = "pi-trackio-grid";
-      for (const m of metricsToShow.slice(0, 16)) {
+      for (const m of metricsToShow) {
         const box = document.createElement("div");
         box.className = "pi-trackio-plot-box";
         box.dataset.metric = m;
@@ -1570,21 +1732,46 @@
 
         const canvasWrap = document.createElement("div");
         canvasWrap.className = "pi-trackio-canvas-wrap";
-        const canvas = document.createElement("canvas");
-        const tooltip = document.createElement("div");
-        tooltip.className = "pi-trackio-tooltip";
-        canvasWrap.append(canvas, tooltip);
 
         box.append(titleRow, canvasWrap);
         grid.append(box);
       }
       bodyWrap.append(grid);
-      requestAnimationFrame(() => repaintPlots());
+      for (const box of grid.children) plotObserver.observe(box);
     }
 
     function rebuildRunsAndSummary() {
       const data = state.data;
       if (!data) return;
+      const chartParams = new URLSearchParams({ project: state.project, smoothing: String(state.smoothing) });
+      allChartsLink.href = `/__trackio/charts?${chartParams}`;
+      if (window.__piTrackioStandalone) {
+        allChartsLink.textContent = "Full Trackio UI";
+        allChartsLink.href = buildTrackioAppUrl(state);
+      }
+      const activityByName = new Map();
+      for (const row of state.activity?.runs || []) {
+        activityByName.set(row.run_name, activityByName.has(row.run_name)
+          ? { ...row, job: { status: "unknown", detail: "Multiple run identities share this name." } }
+          : row);
+      }
+      const activityLabel = (r) => {
+        if (!r) return "Unknown";
+        const metricAge = r.metricAgeSeconds;
+        const age = metricAge === null ? "no metrics yet" : metricAge < 60 ? `${Math.floor(metricAge)}s ago` : metricAge < 3600 ? `${Math.floor(metricAge / 60)}m ago` : `${Math.floor(metricAge / 3600)}h ago`;
+        const job = r.job?.label || "Unknown";
+        const reported = r.job?.source === "Trackio config (reported)" ? " (reported)" : "";
+        return `${job}${reported} · metrics ${age}`;
+      };
+      if (state.activity) {
+        const rows = state.activity.runs;
+        const counts = new Map();
+        for (const row of rows) {
+          const label = row.job?.label || "Unknown";
+          counts.set(label, (counts.get(label) || 0) + 1);
+        }
+        activitySummary.textContent = `${[...counts].map(([label, count]) => `${count} ${label.toLowerCase()}`).join(" · ")}. Job state checked every 30s; metric activity is separate.`;
+      } else activitySummary.textContent = "Run activity unavailable";
 
       if (Array.isArray(data.allProjects) && data.allProjects.length > 0) {
         projectSelect.innerHTML = "";
@@ -1610,7 +1797,7 @@
       for (const rName of allRunNames) {
         const opt = document.createElement("option");
         opt.value = rName;
-        opt.textContent = `🎯 ${rName}`;
+        opt.textContent = `${activityLabel(activityByName.get(rName))} · ${rName}`;
         if (rName === state.soloRun) opt.selected = true;
         runFocusSelect.append(opt);
       }
@@ -1628,6 +1815,7 @@
         runsBar.append(noneSpan);
       } else {
         for (const s of series) {
+          if (!matchesJobFilter(state, s.run)) continue;
           const chip = document.createElement("button");
           chip.type = "button";
           const isSolo = state.soloRun === s.run;
@@ -1639,7 +1827,12 @@
           swatch.style.background = color;
           const runLabel = document.createElement("span");
           runLabel.textContent = s.run;
-          chip.append(swatch, runLabel);
+          const badge = document.createElement("span");
+          const activity = activityByName.get(s.run);
+          badge.textContent = activityLabel(activity);
+          badge.style.color = activity?.job?.status === "running" ? "#4ade80" : activity?.job?.status === "failed" ? "#fb7185" : "#a2b2d4";
+          chip.title = `${activity?.job?.source || "Unknown source"} · ${activity?.job?.checkedAt || "not checked"}\n${activity?.job?.detail || ""}`;
+          chip.append(swatch, runLabel, badge);
           chip.onclick = () => {
             if (state.soloRun) {
               state.soloRun = state.soloRun === s.run ? "" : s.run;
@@ -1665,6 +1858,7 @@
       }
 
       // Per-Run Loss & Metrics Summary Table
+      if (window.__piTrackioStandalone) return;
       const metricsToShow = visibleMetricsList();
       if (state.soloRun) {
         const solo = series.find((s) => s.run === state.soloRun);
@@ -1749,6 +1943,10 @@
     }
 
     async function fetchAndRender(forceRebuild = false) {
+      if (state.fetching) { state.fetchAgain = true; return; }
+      state.fetching = true;
+      const requestedProject = state.project;
+      const previousJobs = JSON.stringify((state.activity?.runs || []).map(r => r.job?.status));
       try {
         const runsToRequest = state.soloRun
           ? [state.soloRun]
@@ -1759,7 +1957,15 @@
           project: state.project || undefined,
           runs: runsToRequest,
           xAxis: state.xAxis,
+          allRuns: state.allRuns,
         });
+        if (state.project && state.project !== requestedProject) return;
+        try {
+          const response = await fetch(`/__trackio/activity?project=${encodeURIComponent(payload.project)}`);
+          state.activity = response.ok ? await response.json() : null;
+        } catch { state.activity = null; }
+        if (state.project && state.project !== requestedProject) return;
+        if (state.jobFilter !== "all" && previousJobs !== JSON.stringify((state.activity?.runs || []).map(r => r.job?.status))) forceRebuild = true;
         state.allProjectRuns = payload.allRuns;
         const prevMetricsKey = (state.data?.availableMetrics || []).join("|");
         const nextMetricsKey = (payload.availableMetrics || []).join("|");
@@ -1769,6 +1975,7 @@
         state.error = null;
         popBtn.href = buildTrackioAppUrl(state);
         rebuildRunsAndSummary();
+        if (state.mode === "dashboard") refreshDashboard();
         if (state.mode === "chart") {
           if (forceRebuild || prevMetricsKey !== nextMetricsKey || !bodyWrap.querySelector(".pi-trackio-grid")) {
             rebuildPlotGrid();
@@ -1781,6 +1988,12 @@
         if (!state.data) {
           state.error = `Trackio series fetch failed: ${err?.message || err}`;
           if (state.mode === "chart") rebuildPlotGrid();
+        }
+      } finally {
+        state.fetching = false;
+        if (state.fetchAgain || (requestedProject && requestedProject !== state.project)) {
+          state.fetchAgain = false;
+          void fetchAndRender(true);
         }
       }
     }
@@ -1817,9 +2030,20 @@
     const pollInterval = setInterval(() => {
       if (!document.body.contains(root)) {
         clearInterval(pollInterval);
+        plotObserver.disconnect();
+        resizeObserver.disconnect();
         return;
       }
-      if (!state.live || document.hidden || state.mode !== "chart") return;
+      if (document.hidden) return;
+      if (state.mode === "dashboard" && state.project) {
+        const project = state.project;
+        void fetch(`/__trackio/activity?project=${encodeURIComponent(project)}`)
+          .then(response => response.ok ? response.json() : null)
+          .then(activity => { if (project === state.project) { state.activity = activity; rebuildRunsAndSummary(); } })
+          .catch(() => {});
+        return;
+      }
+      if (!state.live) return;
       void fetchAndRender(false);
     }, 4000);
 
@@ -1893,7 +2117,86 @@
     return { parent: document.body, before: null };
   }
 
+  function openComputeDock() {
+    const existing = document.getElementById(COMPUTE_DOCK_ID);
+    if (existing) {
+      existing.remove();
+      document.getElementById(COMPUTE_TOOLBAR_ID)?.setAttribute("aria-expanded", "false");
+      return;
+    }
+    document.getElementById(DOCK_ID)?.remove();
+    document.getElementById(TOOLBAR_ID)?.setAttribute("aria-expanded", "false");
+
+    const dock = document.createElement("aside");
+    dock.id = COMPUTE_DOCK_ID;
+    dock.className = "pi-compute-dock";
+    dock.setAttribute("aria-label", "Active compute dashboard");
+    const grip = document.createElement("div");
+    grip.className = "pi-compute-grip";
+    grip.title = "Drag to resize split-screen panel";
+    let dragging = false;
+    grip.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      grip.classList.add("is-dragging");
+      e.preventDefault();
+    });
+    window.addEventListener("pointermove", (e) => {
+      if (!dragging || !dock.isConnected) return;
+      const width = Math.max(360, Math.min(window.innerWidth - e.clientX, window.innerWidth * 0.85));
+      dock.style.setProperty("--pi-compute-width", `${width}px`);
+    });
+    window.addEventListener("pointerup", () => {
+      dragging = false;
+      grip.classList.remove("is-dragging");
+    });
+
+    const header = document.createElement("div");
+    header.className = "pi-compute-header";
+    const title = document.createElement("strong");
+    title.textContent = "⚡ Active compute";
+    const label = document.createElement("span");
+    label.textContent = "Modal · GCP · SF Compute";
+    const spacer = document.createElement("div");
+    spacer.style.flex = "1";
+    const pop = document.createElement("a");
+    pop.className = "pi-trackio-btn";
+    pop.href = COMPUTE_URL;
+    pop.target = "_blank";
+    pop.rel = "noopener noreferrer";
+    pop.textContent = "↗";
+    pop.title = "Open active compute dashboard in a new tab";
+    pop.setAttribute("aria-label", pop.title);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "pi-trackio-btn";
+    close.textContent = "✕";
+    close.title = "Close active compute dashboard";
+    close.setAttribute("aria-label", close.title);
+    close.onclick = () => {
+      dock.remove();
+      document.getElementById(COMPUTE_TOOLBAR_ID)?.setAttribute("aria-expanded", "false");
+    };
+    header.append(title, label, spacer, pop, close);
+    const body = document.createElement("div");
+    body.className = "pi-compute-body";
+    const iframe = document.createElement("iframe");
+    iframe.src = COMPUTE_URL + "?embed=1";
+    iframe.title = "Active compute dashboard";
+    iframe.loading = "eager";
+    iframe.style.cssText = "flex:1;width:100%;height:100%;border:0;background:#0d1326;display:block";
+    body.append(iframe);
+    dock.append(grip, header, body);
+    const { parent, before } = findSplitScreenHost();
+    if (before) parent.insertBefore(dock, before);
+    else parent.append(dock);
+    document.getElementById(COMPUTE_TOOLBAR_ID)?.setAttribute("aria-expanded", "true");
+  }
+
   function openDock(spec = {}) {
+    if (document.getElementById(COMPUTE_DOCK_ID)) {
+      document.getElementById(COMPUTE_DOCK_ID)?.remove();
+      document.getElementById(COMPUTE_TOOLBAR_ID)?.setAttribute("aria-expanded", "false");
+    }
     if (!dockEl || !document.body.contains(dockEl)) {
       dockEl = document.createElement("aside");
       dockEl.id = DOCK_ID;
@@ -1996,6 +2299,13 @@
   }
 
   window.__piTrackioOpenDock = openDock;
+  window.__piComputeOpenDock = openComputeDock;
+
+  if (window.__piTrackioStandalone) {
+    const explorer = createInteractiveExplorer(window.__piTrackioStandalone, { isSidePanel: true });
+    document.getElementById("pi-trackio-standalone").append(explorer.root);
+    return;
+  }
 
   // --- Scan DOM for toolbar, ```trackio blocks, and Trackio links ------------
   function scanDom() {
@@ -2031,6 +2341,26 @@
       }
     }
 
+    if (!document.getElementById(COMPUTE_TOOLBAR_ID)) {
+      const trackioBtn = document.getElementById(TOOLBAR_ID);
+      const anchor = trackioBtn ||
+        document.getElementById("pi-web-tmux-toolbar") ||
+        document.querySelector('button[aria-controls="file-panel"]');
+      if (anchor?.parentElement) {
+        const btn = document.createElement("button");
+        btn.id = COMPUTE_TOOLBAR_ID;
+        btn.type = "button";
+        btn.title = "Toggle the active-compute dashboard (Modal · GCP · SF Compute)";
+        btn.setAttribute("aria-controls", COMPUTE_DOCK_ID);
+        btn.setAttribute("aria-expanded", String(Boolean(document.getElementById(COMPUTE_DOCK_ID))));
+        btn.append(document.createTextNode("⚡ Compute"));
+        btn.style.cssText =
+          "display:inline-flex;align-items:center;min-height:44px;padding:0 10px;border:none;background:transparent;color:var(--text-dim,#a2b2d4);font:inherit;font-size:12px;cursor:pointer;flex-shrink:0";
+        btn.onclick = () => openComputeDock();
+        anchor.parentElement.insertBefore(btn, trackioBtn ? trackioBtn.nextSibling : anchor);
+      }
+    }
+
     const codeBlocks = document.querySelectorAll(".markdown-code-block");
     for (const block of codeBlocks) {
       if (block.dataset.trackioMounted && block.querySelector(":scope > .pi-trackio-card")) continue;
@@ -2056,6 +2386,7 @@
         continue;
       }
       const origHref = link.getAttribute("href") || "";
+      if (isComputeHref(origHref)) continue;
       const parsed = parseTrackioLinkHref(origHref);
       if (!parsed) continue;
       link.dataset.trackioEnhanced = "1";
@@ -2089,6 +2420,13 @@
       const anchor = target.closest("a");
       if (!anchor) return;
       if (anchor.classList.contains("pi-trackio-ext-tab") || anchor.classList.contains("pi-trackio-btn")) {
+        return;
+      }
+      if (isComputeHref(anchor.getAttribute("href") || "")) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        openComputeDock();
         return;
       }
       let parsed = null;

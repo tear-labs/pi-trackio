@@ -156,7 +156,7 @@ test("pi-trackio client + proxy + extension end-to-end", async () => {
     piTrackioExtension(mockPi as unknown as Parameters<typeof piTrackioExtension>[0]);
     assert.deepEqual(
       [...registeredTools.keys()].sort(),
-      ["trackio_log", "trackio_plot", "trackio_query", "trackio_status"],
+      ["compute_status", "trackio_log", "trackio_plot", "trackio_query", "trackio_status"],
     );
 
     const plotTool = registeredTools.get("trackio_plot")!;

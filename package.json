@@ -21,7 +21,7 @@
     ]
   },
   "scripts": {
-    "test": "node --test test/trackio.test.ts"
+    "test": "node --test test/trackio.test.ts test/compute.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

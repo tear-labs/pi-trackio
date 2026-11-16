@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { getJobStatuses, JOB_LABELS } from "./run-lifecycle.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -36,6 +37,21 @@ export interface SeriesPoint {
   step: number;
   time?: number | string | null;
   value: number;
+}
+
+export function runActivity(row: Record<string, unknown>, now = Date.now()) {
+  const age = (raw: unknown): number | null => {
+    if (typeof raw !== "string" || !raw) return null;
+    const timestamp = Date.parse(/(?:Z|[+-]\d\d:\d\d)$/.test(raw) ? raw : `${raw}Z`);
+    if (!Number.isFinite(timestamp) || timestamp > now + 60000) return null;
+    return Math.max(0, (now - timestamp) / 1000);
+  };
+  const metricAgeSeconds = age(row.last_metric);
+  const telemetryAgeSeconds = age(row.last_system);
+  const state = metricAgeSeconds !== null && metricAgeSeconds <= 120 ? "updating"
+    : telemetryAgeSeconds !== null && telemetryAgeSeconds <= 120 ? "telemetry-only"
+    : metricAgeSeconds !== null || telemetryAgeSeconds !== null ? "quiet" : "unknown";
+  return { ...row, state, metricAgeSeconds, telemetryAgeSeconds };
 }
 
 export interface RunSeries {
@@ -345,6 +361,24 @@ export class TrackioClient {
       );
       return JSON.parse(stdout);
     }
+  }
+
+  public async getRunActivity(project: string) {
+    // Correlated lookups use the per-run timestamp indexes; no metric history
+    // or model-specific run directories need to be read to populate badges.
+    const result = await this.callApi<{ rows?: Array<Record<string, unknown>> }>("query_project", {
+      project,
+      query: `SELECT c.run_id, c.run_name, c.config,
+        (SELECT m.timestamp FROM metrics m WHERE m.run_id = c.run_id ORDER BY m.timestamp DESC LIMIT 1) AS last_metric,
+        (SELECT s.timestamp FROM system_metrics s WHERE s.run_id = c.run_id ORDER BY s.timestamp DESC LIMIT 1) AS last_system
+        FROM configs c ORDER BY c.created_at DESC`,
+    });
+    const rows = result.rows || [];
+    const jobs = await getJobStatuses(project, rows);
+    const byId = new Map(jobs.map(job => [job.run_id, { ...job, label: JOB_LABELS[job.status] || "Unknown" }]));
+    const now = Date.now();
+    return { project, checkedAt: new Date(now).toISOString(), recentSeconds: 120,
+      runs: rows.map(({ config: _config, ...row }) => ({ ...runActivity(row, now), job: byId.get(row.run_id) })) };
   }
 
   public async logMetrics(params: {
